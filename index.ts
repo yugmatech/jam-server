@@ -18,11 +18,70 @@ function isOriginAllowed(origin: string | undefined): boolean {
 }
 
 const app = express();
+
+/** Numeric Apple App Store ID (e.g. from App Store Connect) — Smart App Banner, /join fallback URL, and optional AASA docs. */
+const APPLE_APP_STORE_ID = process.env.APPLE_APP_STORE_ID?.trim() ?? '';
+/** Apple Developer Team ID — required for Universal Links AASA `appID` (`{teamId}.{bundleId}`). */
+const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID?.trim() ?? '';
+/** iOS bundle identifier (defaults to Sound Room). */
+const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID?.trim() || 'com.valaki.soundroom';
+
 app.use(
   cors({
     origin: (origin, callback) => callback(null, isOriginAllowed(origin)),
   })
 );
+
+/** Apple Universal Links — host this at https://jam.valaki.in/.well-known/apple-app-site-association (no redirects). Set APPLE_TEAM_ID (+ optional APPLE_BUNDLE_ID). */
+app.get('/.well-known/apple-app-site-association', (_req, res) => {
+  if (!APPLE_TEAM_ID) {
+    res.status(404).type('text/plain').send('Apple Team ID not configured (set APPLE_TEAM_ID).');
+    return;
+  }
+  const body = {
+    applinks: {
+      apps: [] as unknown[],
+      details: [
+        {
+          appID: `${APPLE_TEAM_ID}.${APPLE_BUNDLE_ID}`,
+          paths: ['/join', '/join/*'],
+        },
+      ],
+    },
+  };
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.json(body);
+});
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function joinErrorHtml(title: string, detail: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    body { margin: 0; color: #111; background: #fafafa; font-family: system-ui, sans-serif; }
+    .box { text-align: center; padding-top: 50px; max-width: 28rem; margin: 0 auto; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>${escapeHtml(title)}</h2>
+    <p>${escapeHtml(detail)}</p>
+  </div>
+</body>
+</html>`;
+}
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -55,6 +114,7 @@ interface Room {
     queue: any[];
     queueIndex: number;
     updatedAt: number; // to calculate sync offsets
+    repeatMode?: string;
   };
   permissions: {
     sharedControl: boolean; // if false, only host controls
@@ -77,6 +137,139 @@ function normalizeRoomId(roomId: string | undefined | null): string | null {
   return t.length > 0 ? t : null;
 }
 
+/** Auto-generated jam codes: 8 base-36 chars (0–9, A–Z), uppercase. */
+function generateRandomRoomId(): string {
+  const alphabet = '0123456789abcdefghijklmnopqrstuvwxyz';
+  let s = '';
+  for (let i = 0; i < 8; i++) {
+    s += alphabet[Math.floor(Math.random() * 36)];
+  }
+  return s.toUpperCase();
+}
+
+/**
+ * Universal Link landing: `?id=` room code only. Host name and permissions come from the live room on this server (not from query params).
+ * Deep link: `soundroom://jam?id=ROOM` (id only).
+ */
+app.get('/join', (req, res) => {
+  const idRaw = req.query.id;
+  const roomIdRaw =
+    typeof idRaw === 'string'
+      ? idRaw
+      : Array.isArray(idRaw) && typeof idRaw[0] === 'string'
+        ? idRaw[0]
+        : '';
+  const rid = normalizeRoomId(roomIdRaw);
+
+  const appStoreUrl = APPLE_APP_STORE_ID
+    ? `https://apps.apple.com/app/id${APPLE_APP_STORE_ID}`
+    : 'https://apps.apple.com/';
+  const playStoreUrl = 'https://play.google.com/store/apps/details?id=com.valaki.soundroom';
+
+  if (!rid) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(400).send(joinErrorHtml('Invalid room code', 'Check the link and try again.'));
+    return;
+  }
+
+  const room = rooms.get(rid);
+  if (!room) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(404).send(
+      joinErrorHtml('Session not found', 'This jam may have ended, or the code is wrong.')
+    );
+    return;
+  }
+
+  const hostLabel = escapeHtml(room.hostUsername);
+  const roomIdJs = JSON.stringify(rid);
+  const smartBannerMeta =
+    APPLE_APP_STORE_ID ?
+      `    <meta name="apple-itunes-app" content="app-id=${escapeHtml(APPLE_APP_STORE_ID)}">\n`
+    : '';
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Join Sound Room Jam</title>
+${smartBannerMeta}    <style>
+      body { margin: 0; color: #111; background: #fafafa; }
+    </style>
+</head>
+<body>
+    <div style="text-align: center; font-family: system-ui, sans-serif; padding-top: 50px; max-width: 28rem; margin: 0 auto;">
+        <h2>Redirecting to Sound Room…</h2>
+        <p>Session hosted by <strong>${hostLabel}</strong>.</p>
+        <p>If you don't have the app installed, you'll be redirected to the store.</p>
+    </div>
+    <script>
+        (function () {
+            var roomId = ${roomIdJs};
+            var appStoreUrl = ${JSON.stringify(appStoreUrl)};
+            var playStoreUrl = ${JSON.stringify(playStoreUrl)};
+            var deepLink = 'soundroom://jam?id=' + encodeURIComponent(roomId);
+            var left = false;
+            function markLeft() { left = true; }
+            window.addEventListener('pagehide', markLeft);
+            window.addEventListener('blur', markLeft);
+            document.addEventListener('visibilitychange', function () {
+                if (document.visibilityState === 'hidden') markLeft();
+            });
+            window.location.href = deepLink;
+            setTimeout(function () {
+                if (left) return;
+                var ua = navigator.userAgent || '';
+                var isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+                var isAndroid = /android/i.test(ua);
+                if (isIOS) {
+                    window.location.href = appStoreUrl;
+                } else if (isAndroid) {
+                    window.location.href = playStoreUrl;
+                } else {
+                    document.body.innerHTML = '<div style="text-align:center;font-family:system-ui,sans-serif;padding-top:50px;"><h2>Please open this link on your mobile device</h2><p>Sound Room is available on iOS and Android.</p></div>';
+                }
+            }, 2500);
+        })();
+    </script>
+</body>
+</html>`;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.send(html);
+});
+
+/** Pre-connect JSON for native clients: host + permissions by room id (same process memory as Socket.IO). */
+app.get('/api/room/:id', (req, res) => {
+  const param = req.params.id;
+  const idStr = typeof param === 'string' ? param : Array.isArray(param) ? param[0] ?? '' : '';
+  const rid = normalizeRoomId(idStr);
+  if (!rid) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(400).json({ success: false, message: 'Invalid room code' });
+    return;
+  }
+  const room = rooms.get(rid);
+  if (!room) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(404).json({ success: false, message: 'Room not found' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json({
+    success: true,
+    roomId: rid,
+    hostUsername: room.hostUsername,
+    permissions: {
+      sharedControl: Boolean(room.permissions.sharedControl),
+    },
+  });
+});
+
 io.on('connection', (socket: Socket) => {
   console.log('User connected:', socket.id);
 
@@ -90,11 +283,16 @@ io.on('connection', (socket: Socket) => {
   });
 
   socket.on('create_room', (data: { username: string, sharedControl: boolean, subsonicInfo?: any, customRoomId?: string }, callback) => {
-    // Generate a simple room ID or use custom
-    let roomId = data.customRoomId?.trim().toUpperCase() || Math.random().toString(36).substring(2, 8).toUpperCase();
-    
-    if (data.customRoomId && rooms.has(roomId)) {
-      return callback({ success: false, message: 'Room code already exists. Please choose a different one.' });
+    let roomId: string;
+    if (data.customRoomId?.trim()) {
+      roomId = data.customRoomId.trim().toUpperCase();
+      if (rooms.has(roomId)) {
+        return callback({ success: false, message: 'Room code already exists. Please choose a different one.' });
+      }
+    } else {
+      do {
+        roomId = generateRandomRoomId();
+      } while (rooms.has(roomId));
     }
     
     const newRoom: Room = {
@@ -108,7 +306,8 @@ io.on('connection', (socket: Socket) => {
         songId: null,
         queue: [],
         queueIndex: 0,
-        updatedAt: Date.now()
+        updatedAt: Date.now(),
+        repeatMode: 'off'
       },
       permissions: {
         // Coerce wire payloads (some clients send strings / 0/1).
@@ -174,10 +373,11 @@ io.on('connection', (socket: Socket) => {
     callback({ success: true, room });
   });
 
-  /** Pre-join: session type for join UI (e.g. hide "remote control" when host leads). */
+  /** Pre-join: host + session type for join UI (authoritative; do not trust URL query params). */
   socket.on('peek_room', (roomId: string, callback: (res: {
     success: boolean;
     message?: string;
+    hostUsername?: string;
     permissions?: { sharedControl: boolean };
   }) => void) => {
     const rid = normalizeRoomId(roomId);
@@ -192,6 +392,7 @@ io.on('connection', (socket: Socket) => {
     }
     callback({
       success: true,
+      hostUsername: room.hostUsername,
       permissions: {
         sharedControl: Boolean(room.permissions.sharedControl),
       },
