@@ -412,6 +412,40 @@ function mergePlaybackSelective(
   return out;
 }
 
+/**
+ * Stored `currentTime` is from the last push, which can be minutes old. While playing, advance it by the
+ * elapsed time so a resync lands the asker on the live position instead of rewinding them.
+ */
+function livePlaybackState(s: Room['playbackState']): Room['playbackState'] {
+  if (!s.isPlaying) return s;
+  const t = s.currentTime + (Date.now() - s.updatedAt) / 1000;
+  const duration = Number(s.queue?.[s.queueIndex]?.duration);
+  return { ...s, currentTime: duration > 0 ? Math.min(t, duration) : t };
+}
+
+/** Same as the iOS host's "follow a guest scrub" threshold: a smaller time difference is latency, not a seek. */
+const JAM_GUEST_ECHO_TIME_TOLERANCE_S = 2.5;
+
+/**
+ * True when a guest update changes nothing but the clock, and the clock agrees with the room's.
+ * App builds that re-push every snapshot they apply (shuffle on + group controls) otherwise loop:
+ * push → echo → apply → push, rewinding playback on every round.
+ */
+function isGuestEcho(prev: Room['playbackState'], next: Room['playbackState']): boolean {
+  const ids = (q: any[]) => q.map((s) => s?.id).join('\n');
+  return (
+    next.isPlaying === prev.isPlaying &&
+    next.songId === prev.songId &&
+    next.queueIndex === prev.queueIndex &&
+    next.repeatMode === prev.repeatMode &&
+    next.shuffleEnabled === prev.shuffleEnabled &&
+    next.shufflePosition === prev.shufflePosition &&
+    String(next.shuffleOrder) === String(prev.shuffleOrder) &&
+    ids(next.queue) === ids(prev.queue) &&
+    Math.abs(next.currentTime - livePlaybackState(prev).currentTime) <= JAM_GUEST_ECHO_TIME_TOLERANCE_S
+  );
+}
+
 /** Room map keys are always UPPERCASE; client may send mixed case — must normalize or leave/join no-op. */
 function normalizeRoomId(roomId: string | undefined | null): string | null {
   if (roomId == null || typeof roomId !== 'string') return null;
@@ -748,6 +782,8 @@ io.on('connection', (socket: Socket) => {
 
     const nextSeq = (prev.playbackSeq ?? 0) + 1;
     const mergedBody = mergePlaybackSelective(prev, incomingForMerge);
+    // Not when fields were stripped above: that guest needs the echo to get back onto the host's track.
+    if (!isHost && incomingForMerge === incoming && isGuestEcho(prev, mergedBody)) return;
     room.playbackState = {
       ...mergedBody,
       updatedAt: Date.now(),
@@ -782,7 +818,7 @@ io.on('connection', (socket: Socket) => {
     if (!rid) return;
     const room = rooms.get(rid);
     if (!room) return;
-    socket.emit('playback_state_updated', room.playbackState);
+    socket.emit('playback_state_updated', livePlaybackState(room.playbackState));
   });
 
   /** Refresh full room (participants, etc.) from server — e.g. when opening the jam dialog. */
