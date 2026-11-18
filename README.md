@@ -45,9 +45,16 @@ PORT=3001
 
 1. Build your web app (e.g. in `navidrome-jam`, build `navidrome_src/ui`).
 2. Point `JAM_UI_DIST` at that `build` folder.
-3. Put **Nginx** (or similar) in front on **443**, proxy WebSocket upgrades to this Node process, and proxy Navidrome `/rest` (and related) to your music server if you use a single hostname. See `navidrome-jam/nginx_jam.conf` for an example combined layout.
+3. Put **Nginx** (or similar) in front on **443**, proxy WebSocket upgrades to this Node process, and proxy Navidrome `/rest` (and related) to your music server if you use a single hostname. See `deployment/nginx-jam.conf` (valaki) and `deployment/nginx-jam-soundroom.conf`.
 
-Clients should connect Socket.IO to the **same public origin** people use in the browser for the jam site (HTTPS → WSS), not necessarily the Navidrome URL.
+Public jam hosts (**both active** — backward compatible during migration):
+
+| Host | Status |
+| ---- | ------ |
+| `https://jam.valaki.in` | **Current default** — existing apps and share links keep using this |
+| `https://jam.soundroom.in` | Parallel — becomes primary in ~3–4 days; then retire valaki vhost |
+
+No redirects between hosts. Either origin hits the same Node process. Clients should connect Socket.IO to the **same public origin** as their share link (HTTPS → WSS), not necessarily the Navidrome URL.
 
 ---
 
